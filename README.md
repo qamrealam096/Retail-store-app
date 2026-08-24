@@ -385,12 +385,12 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](./LICE
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/qamrealam096/Retail-store-app-app/issues)
+- **Issues**: [GitHub Issues](https://github.com/qamrealam096/Retail-store-app/issues)
 
 ---
 
 <div align="center">
-
+i
 **⭐ Star this repository if you found it helpful!**
 
 **🔄 For advanced GitOps workflows, see [BRANCHING_STRATEGY.md](./BRANCHING_STRATEGY.md)**
