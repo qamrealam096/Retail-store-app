@@ -1,0 +1,290 @@
+name: Deploy
+
+on:
+  push:
+    branches: [gitops]
+    paths: ["src/**"]
+  workflow_dispatch:
+
+# Deny all permissions at workflow level; grant only what each job needs
+permissions: {}
+
+env:
+  # AWS_REGION is not sensitive — use a repository variable, not a secret
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Detect which services changed
+  # ─────────────────────────────────────────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      changed-services: ${{ steps.changes.outputs.changed-services }}
+      matrix: ${{ steps.changes.outputs.matrix }}
+      has-changes: ${{ steps.changes.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed services
+        id: changes
+        # Assign GitHub context values to env vars first to avoid expression injection
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          SERVICES=("ui" "catalog" "cart" "checkout" "orders")
+          CHANGED_SERVICES=()
+
+          echo "Checking for changes in services..."
+
+          # Manual trigger — build all services; no need to check git diff
+          if [ "${EVENT_NAME}" == "workflow_dispatch" ]; then
+            echo "Manual trigger - building all services"
+            CHANGED_SERVICES=("${SERVICES[@]}")
+          else
+            for service in "${SERVICES[@]}"; do
+              if git diff --name-only HEAD~1 HEAD | grep -q "^src/${service}/"; then
+                CHANGED_SERVICES+=("${service}")
+                echo "Changes detected in: ${service}"
+              else
+                echo "No changes in: ${service}"
+              fi
+            done
+          fi
+
+          if [ ${#CHANGED_SERVICES[@]} -eq 0 ]; then
+            echo "No services changed"
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build JSON matrix for changed services only
+          MATRIX_JSON="["
+          for i in "${!CHANGED_SERVICES[@]}"; do
+            [ "$i" -gt 0 ] && MATRIX_JSON+=","
+            MATRIX_JSON+="\"${CHANGED_SERVICES[$i]}\""
+          done
+          MATRIX_JSON+="]"
+
+          echo "changed-services=${CHANGED_SERVICES[*]}" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"service\":${MATRIX_JSON}}" >> "$GITHUB_OUTPUT"
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
+
+          echo "Services to build: ${CHANGED_SERVICES[*]}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Build & push Docker images (runs in parallel per service)
+  # Helm values are NOT committed here; image tags are passed as job outputs
+  # to avoid the parallel-commit race condition.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    permissions:
+      id-token: write   # required for OIDC authentication
+      contents: read
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+    outputs:
+      # Each matrix leg writes its tag; the commit job reads all of them
+      tag: ${{ steps.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # OIDC — short-lived credentials; no stored access keys needed
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, scan and push ${{ matrix.service }}
+        id: build
+        # Assign context values to env vars — prevents expression injection
+        env:
+          SERVICE: ${{ matrix.service }}
+          GIT_SHA: ${{ github.sha }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          TAG="$(echo "${GIT_SHA}" | cut -c1-7)"
+          ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/retail-store-${SERVICE}"
+
+          echo "Building ${SERVICE}:${TAG}"
+
+          # Create ECR repository if it does not exist
+          aws ecr describe-repositories --repository-names "retail-store-${SERVICE}" 2>/dev/null || \
+            aws ecr create-repository \
+              --repository-name "retail-store-${SERVICE}" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+
+          # Build image with only the versioned tag (no :latest — avoids mutable tag race)
+          docker build -t "${ECR_REPO}:${TAG}" "src/${SERVICE}/"
+
+          # Scan for critical vulnerabilities before pushing
+          echo "Scanning image for vulnerabilities..."
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+              --exit-code 1 \
+              --severity CRITICAL \
+              --no-progress \
+              "${ECR_REPO}:${TAG}" || {
+            echo "CRITICAL vulnerabilities found in ${SERVICE} — aborting push"
+            exit 1
+          }
+
+          # Push versioned tag only
+          docker push "${ECR_REPO}:${TAG}"
+
+          echo "Pushed ${ECR_REPO}:${TAG}"
+
+          # Expose outputs for the serialized commit job
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "ecr_repo=${ECR_REPO}" >> "$GITHUB_OUTPUT"
+          echo "ECR_REPO=${ECR_REPO}" >> "$GITHUB_ENV"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Commit Helm value updates SERIALLY (one job, not a matrix)
+  # This eliminates the parallel-push race condition entirely.
+  # ─────────────────────────────────────────────────────────────────────────────
+  update-helm:
+    name: Update Helm Values
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [detect-changes, build]
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    permissions:
+      contents: write   # needed to push Helm value changes back to gitops branch
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fetch the latest state of gitops branch to minimise conflicts
+          ref: gitops
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Helm values for all changed services
+        # Assign context values to env vars — prevents expression injection
+        env:
+          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.changed-services }}
+          GIT_SHA: ${{ github.sha }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          TAG="$(echo "${GIT_SHA}" | cut -c1-7)"
+
+          git config --local user.email "gitops@github.com"
+          git config --local user.name "GitOps Bot"
+
+          COMMITTED=false
+
+          for SERVICE in ${CHANGED_SERVICES}; do
+            ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/retail-store-${SERVICE}"
+            VALUES_FILE="src/${SERVICE}/chart/values.yaml"
+
+            if [[ ! -f "${VALUES_FILE}" ]]; then
+              echo "Values file not found for ${SERVICE}: ${VALUES_FILE}"
+              continue
+            fi
+
+            cp "${VALUES_FILE}" "${VALUES_FILE}.backup"
+
+            # Update only the top-level image section (preserves sidecar/infra images)
+            awk -v repo="${ECR_REPO}" -v tag="${TAG}" '
+              BEGIN { in_main_image = 0; updated_repo = 0; updated_tag = 0 }
+              /^image:/ { in_main_image = 1; print; next }
+              in_main_image && /^[[:space:]]*repository:/ && !updated_repo {
+                print "  repository: " repo; updated_repo = 1; next
+              }
+              in_main_image && /^[[:space:]]*tag:/ && !updated_tag {
+                print "  tag: \"" tag "\""; updated_tag = 1; next
+              }
+              /^[a-zA-Z]/ && !/^image:/ { in_main_image = 0 }
+              { print }
+            ' "${VALUES_FILE}.backup" > "${VALUES_FILE}"
+
+            if grep -q "${ECR_REPO}" "${VALUES_FILE}" && grep -q "\"${TAG}\"" "${VALUES_FILE}"; then
+              echo "Updated ${VALUES_FILE}"
+              rm "${VALUES_FILE}.backup"
+              git add "${VALUES_FILE}"
+              COMMITTED=true
+            else
+              echo "Update failed for ${SERVICE} — restoring backup"
+              mv "${VALUES_FILE}.backup" "${VALUES_FILE}"
+            fi
+          done
+
+          if [ "${COMMITTED}" == "true" ]; then
+            git commit -m "chore: update Helm image tags to ${TAG} [skip ci]"
+            git push origin gitops
+            echo "Helm values committed and pushed"
+          else
+            echo "No Helm changes to commit"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4 — Deployment summary
+  # ─────────────────────────────────────────────────────────────────────────────
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [detect-changes, build, update-helm]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Write deployment summary
+        # Assign context values to env vars — prevents expression injection
+        env:
+          GIT_SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          HAS_CHANGES: ${{ needs.detect-changes.outputs.has-changes }}
+          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.changed-services }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          HELM_RESULT: ${{ needs.update-helm.result }}
+        run: |
+          {
+            echo "## Deployment Summary"
+            echo ""
+            echo "**Commit:** ${GIT_SHA}"
+            echo "**Branch:** ${REF_NAME}"
+            echo "**Triggered by:** ${ACTOR}"
+            echo ""
+
+            if [ "${HAS_CHANGES}" == "true" ]; then
+              echo "**Changed Services:** ${CHANGED_SERVICES}"
+              echo ""
+
+              if [ "${BUILD_RESULT}" == "success" ] && [ "${HELM_RESULT}" == "success" ]; then
+                echo "**Status:** Deployment successful"
+                echo ""
+                echo "**Actions completed:**"
+                echo "- Built and pushed Docker images to ECR (versioned tags only)"
+                echo "- Scanned images for CRITICAL vulnerabilities"
+                echo "- Updated Helm chart values"
+                echo "- Committed changes to gitops branch"
+                echo "- ArgoCD will sync automatically"
+              else
+                echo "**Status:** Deployment failed (build=${BUILD_RESULT}, helm=${HELM_RESULT})"
+                echo "Check the workflow logs for details."
+              fi
+            else
+              echo "**Status:** No services changed — no deployment needed"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
