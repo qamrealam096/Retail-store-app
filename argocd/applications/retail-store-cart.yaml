@@ -8,7 +8,7 @@ metadata:
 spec:
   project: retail-store
   source: 
-    repoURL: https://github.com/YOUR_GITHUB_USERNAME/retail-store-sample-app
+    repoURL: https://github.com/qamrealam096/Retail-store-app.git
     targetRevision: gitops
     path: src/cart/chart
     helm:
